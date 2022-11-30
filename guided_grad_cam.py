@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
 
-# ============================
 
 import torch
 import torch.nn.functional as F
@@ -13,53 +11,6 @@ as_numpy = lambda x: x.detach().cpu().numpy()
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
-jet = cm.get_cmap("jet")
-jet_colors = jet(np.arange(256))[:, :3]
-
-def show_result(img, saliency, label = ""):
-    img = np.array(img, dtype = float) / 255.0
-
-    saliency = F.interpolate(saliency, size = img.shape[:2], mode = "bilinear")
-    #print(img.shape)
-    #print("before",saliency.shape)
-    saliency = as_numpy(saliency)[0, 0]
-    #print("after", saliency.shape)
-    saliency = saliency - saliency.min()
-    saliency = np.uint8(255 * saliency / saliency.max())
-    heatmap = jet_colors[saliency]
-    plt.imshow(0.5 * heatmap + 0.5 * img)
-    plt.axis("off")
-    plt.title(label)
-    plt.show()
-
-def show_fmap(img, saliency, scores):
-    img = np.array(img, dtype = float) / 255.0
-
-    saliency = F.interpolate(saliency, size = img.shape[:2], mode = "bilinear")
-
-    ix = 1
-    ids=5
-    square=4
-    for _ in range(square):
-        for _ in range(square):
-            feature = as_numpy(saliency)[0][ids]
-            # print("after", saliency.shape)
-            feature = feature - feature.min()
-            feature = np.uint8(255 * feature / feature.max())
-            heatmap = jet_colors[feature]
-            # specify subplot and turn of axis
-            ax = plt.subplot(square, square, ix)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_title("{}: {:8.6f}".format(ids, scores[ids]))
-            #plt.imshow(heatmap)
-            plt.imshow(0.5 * heatmap + 0.5 * img)
-            ix += 1
-            ids += 100
-    plt.show()
-
 
 # define the preprocessing transform
 image_shape = (224, 224)
@@ -95,8 +46,7 @@ class Probe:
 
 # load the image
 print("loading the image...")
-img = Image.open("./data/bird.png").convert('RGB')
-
+img = Image.open("./data/dog.png").convert('RGB')
 
 x = transform(img)[None]  # transform and reshape it to [1, C, *image_shape]
 x = x.to(device)
@@ -107,12 +57,23 @@ model = torchvision.models.resnet50(pretrained=True)
 model.eval()
 model.to(device)
 
+def Guided_ReLU_hook(m, g_i, g_o):
+    if isinstance(g_i, tuple):
+        return tuple(g.clamp(min = 0) for g in g_i)
+    return g_i.clamp(min = 0)
+
 #add a probe to model
 probe = Probe()
 #probe will save the output of the layer4 during forward
 handle = model.layer4.register_forward_hook(probe.get_hook())
+#using guided relu for backprop
+handle = [handle] + [
+        m.register_backward_hook(Guided_ReLU_hook)
+        for _, m in model.named_modules() if isinstance(m, torch.nn.ReLU)
+        ]
 
-#print(x.shape)
+x = x.requires_grad_()
+x.retain_grad()
 logits = model(x)
 preds = logits.softmax(-1)
 
@@ -122,27 +83,24 @@ for tag, label, i, prob in decode_predictions(preds)[0]:
 
 print("Calculating the saliency of the top prediction...")
 target = preds.argmax().item()
-#target = 902
 
 ### Grad_Cam
 # get the last_conv_output
 last_conv_output = probe.data[0]
-handle.remove()
-
 last_conv_output.retain_grad() #make sure the intermediate result save its grad
 
 #backprop
 logits[0, target].backward()
+for h in handle: h.remove()
+
 grad = last_conv_output.grad 
 #taking average on the H-W panel
 weight = grad.mean(dim = (-1, -2), keepdim = True)
-
-scores = weight[0,:,0,0]
-#show_fmap(img, last_conv_output,scores)
-
 saliency = (last_conv_output * weight).sum(dim = 1, keepdim = True)
-
 #relu
 saliency = saliency.clamp(min = 0)
 
-show_result(img, saliency, "grad_cam on {} {}".format(*indx2label[str(target)]))
+guided_saliency = x.grad.abs().max(dim = 1, keepdim = True).values
+guided_saliency *= F.interpolate(saliency, size = guided_saliency.shape[-2:], mode = "bilinear")
+plt.imshow(as_numpy(guided_saliency[0, 0]))
+plt.show()
